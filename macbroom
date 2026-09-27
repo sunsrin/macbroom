@@ -1,0 +1,613 @@
+#!/bin/zsh
+set -euo pipefail
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+
+MODE="interactive"
+CLEAR_CHROME_SW=0
+CLEAR_CHROME_AI=0
+CLEAR_AS=0
+CLEAR_PLAYWRIGHT=0
+CLEAR_NPM=0
+CLEAR_GRADLE=0
+CLEAR_XCODE=0
+CLEAR_BUN=0
+CLEAR_CARGO=0
+CLEAR_DOCKER=0
+CLEAR_APPS=0
+CLEAR_AI=0
+CLEAR_LOGS=0
+CLEAR_TRASH=0
+
+show_help() {
+  cat << 'EOF'
+macbroom 🧹 - macOS Storage Cleanup
+
+Usage:
+  macbroom [modes] [options]
+  ./macbroom [modes] [options]
+
+Modes:
+  (default)             Interactive mode (prompts before each cleanup)
+  --dry-run             Inspect and preview reclaimable sizes without deleting anything
+  --yes                 Run recommended default cleanups without interactive prompts
+
+Bundle Flags:
+  --all-dev             Enable all developer cache targets (Xcode, Android Studio,
+                        npm, Gradle, Bun, Cargo, Playwright, Docker)
+  --all-browsers        Enable aggressive browser caches (Service Worker & AI models)
+  --all-apps            Enable desktop app caches (Slack, Discord, Zoom, Spotify)
+  --full                Enable all optional cleanups (interactive prompts still apply
+                        unless combined with --yes)
+
+Individual Opt-in Targets:
+  Developer & Build:
+    --xcode               Remove Xcode DerivedData & iOS DeviceSupport
+    --android-studio      Remove Android Studio cache directories
+    --old-android-studio  Alias for --android-studio
+    --playwright          Uninstall Playwright browsers via npx
+    --npm-cache           Purge npm cache via 'npm cache clean --force'
+    --gradle-cache        Remove ~/.gradle/caches
+    --bun-cache           Remove ~/.bun/install/cache
+    --cargo-cache         Remove ~/.cargo/registry/cache
+    --docker              Prune unused Docker containers, images, and builder cache
+
+  Browsers & Desktop Apps:
+    --chrome-sw-cache     Remove Chrome Service Worker CacheStorage across all profiles
+    --chrome-ai-model     Remove Chrome On-device AI model directory
+    --apps-cache          Remove cache for Slack, Discord, Zoom, Spotify
+
+  AI & Machine Learning:
+    --ai-cache            Remove Hugging Face and PyTorch model download caches
+
+  System & Utilities:
+    --logs                Remove user diagnostic and crash reports
+    --trash               Empty the current user's Trash
+
+  Help:
+    -h, --help            Show this help message
+EOF
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) MODE="dry-run" ;;
+    --yes) MODE="yes" ;;
+    --all-dev)
+      CLEAR_AS=1
+      CLEAR_PLAYWRIGHT=1
+      CLEAR_NPM=1
+      CLEAR_GRADLE=1
+      CLEAR_XCODE=1
+      CLEAR_BUN=1
+      CLEAR_CARGO=1
+      CLEAR_DOCKER=1
+      ;;
+    --all-browsers)
+      CLEAR_CHROME_SW=1
+      CLEAR_CHROME_AI=1
+      ;;
+    --all-apps)
+      CLEAR_APPS=1
+      ;;
+    --full)
+      CLEAR_AS=1
+      CLEAR_PLAYWRIGHT=1
+      CLEAR_NPM=1
+      CLEAR_GRADLE=1
+      CLEAR_XCODE=1
+      CLEAR_BUN=1
+      CLEAR_CARGO=1
+      CLEAR_DOCKER=1
+      CLEAR_CHROME_SW=1
+      CLEAR_CHROME_AI=1
+      CLEAR_APPS=1
+      CLEAR_AI=1
+      CLEAR_LOGS=1
+      CLEAR_TRASH=1
+      ;;
+    --xcode) CLEAR_XCODE=1 ;;
+    --android-studio|--old-android-studio) CLEAR_AS=1 ;;
+    --playwright) CLEAR_PLAYWRIGHT=1 ;;
+    --npm-cache) CLEAR_NPM=1 ;;
+    --gradle-cache) CLEAR_GRADLE=1 ;;
+    --bun-cache) CLEAR_BUN=1 ;;
+    --cargo-cache) CLEAR_CARGO=1 ;;
+    --docker) CLEAR_DOCKER=1 ;;
+    --chrome-sw-cache) CLEAR_CHROME_SW=1 ;;
+    --chrome-ai-model) CLEAR_CHROME_AI=1 ;;
+    --apps-cache) CLEAR_APPS=1 ;;
+    --ai-cache) CLEAR_AI=1 ;;
+    --logs) CLEAR_LOGS=1 ;;
+    --trash) CLEAR_TRASH=1 ;;
+    -h|--help)
+      show_help
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $arg"
+      exit 2
+      ;;
+  esac
+done
+
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "This script is intended for macOS."
+  exit 1
+fi
+
+HOME_DIR="$HOME"
+
+get_avail_kb() {
+  local -a df_line
+  df_line=(${=$(df -k / | tail -1)})
+  echo "${df_line[4]}"
+}
+
+format_kb() {
+  local kb="$1"
+  if (( kb >= 1048576 )); then
+    printf "%.2f GB" "$(( kb / 1048576.0 ))"
+  elif (( kb >= 1024 )); then
+    printf "%.2f MB" "$(( kb / 1024.0 ))"
+  else
+    printf "%d KB" "$kb"
+  fi
+}
+
+human_size() {
+  local p="$1"
+  if [[ -e "$p" ]]; then
+    local out
+    out="$(du -sh "$p" 2>/dev/null || true)"
+    if [[ -n "$out" ]]; then
+      local -a parts
+      parts=(${=out})
+      echo "${parts[1]}"
+      return 0
+    fi
+  fi
+  echo "0B"
+}
+
+confirm() {
+  local prompt="$1"
+  if [[ "$MODE" == "yes" ]]; then
+    return 0
+  elif [[ "$MODE" == "dry-run" ]]; then
+    return 1
+  fi
+
+  local answer
+  read -r "answer?$prompt [y/N] "
+  [[ "$answer" == "y" || "$answer" == "Y" ]]
+}
+
+is_app_running() {
+  local app="$1"
+  # Match exact process name or executable inside app bundle
+  pgrep -x "$app" >/dev/null 2>&1 || pgrep -f "$app.app/Contents/MacOS" >/dev/null 2>&1
+}
+
+check_app_running() {
+  local app_name="$1"
+  if is_app_running "$app_name"; then
+    echo
+    echo "[warn] $app_name is currently running."
+    if [[ "$MODE" == "yes" ]]; then
+      echo "       Skipping cache cleanup for $app_name to avoid file corruption."
+      return 1
+    elif [[ "$MODE" == "dry-run" ]]; then
+      echo "       [notice] Quit $app_name before running the actual cleanup."
+      return 0
+    else
+      if ! confirm "Quit $app_name and continue, or skip this cleanup?"; then
+        echo "       [skip] Skipped."
+        return 1
+      fi
+    fi
+  fi
+  return 0
+}
+
+remove_dir() {
+  local label="$1"
+  local target_dir="$2"
+
+  if [[ -z "$target_dir" || "$target_dir" == "/" || "$target_dir" == "$HOME_DIR" || "$target_dir" == "$HOME_DIR/" ]]; then
+    echo "[error] Refusing to remove invalid or root path: '$target_dir'" >&2
+    return 1
+  fi
+
+  if [[ ! -e "$target_dir" ]]; then
+    echo "[skip] $label: already absent"
+    return 0
+  fi
+
+  local size
+  size="$(human_size "$target_dir")"
+  echo
+  echo "$label: $size"
+  echo "  $target_dir"
+
+  if [[ "$MODE" == "dry-run" ]]; then
+    echo "  [dry-run] would remove"
+    return 0
+  fi
+
+  if confirm "  Remove this cache?"; then
+    rm -rf -- "$target_dir"
+    echo "  [done] removed"
+  else
+    echo "  [skip] kept"
+  fi
+}
+
+echo "============================================================"
+echo " macbroom 🧹 macOS Storage Cleanup"
+echo "============================================================"
+echo
+
+START_AVAIL_KB=$(get_avail_kb)
+echo "Current root filesystem availability: $(format_kb "$START_AVAIL_KB")"
+df -h / | tail -1
+echo
+
+# ------------------------------------------------------------
+# 1. Homebrew cache / stale downloads
+# ------------------------------------------------------------
+if command -v brew >/dev/null 2>&1; then
+  echo "[Homebrew] Preview:"
+  brew cleanup -n || true
+  if [[ "$MODE" == "dry-run" ]]; then
+    echo "[dry-run] Homebrew cleanup not executed."
+  elif confirm "Run 'brew cleanup' now?"; then
+    brew cleanup
+    echo "[done] Homebrew cleanup completed."
+  else
+    echo "[skip] Homebrew cleanup."
+  fi
+else
+  echo "[skip] Homebrew not installed/in PATH."
+fi
+
+# ------------------------------------------------------------
+# 2. pip cache
+# ------------------------------------------------------------
+if command -v python3 >/dev/null 2>&1; then
+  PIP_CACHE="$(python3 -m pip cache dir 2>/dev/null || true)"
+  if [[ -n "$PIP_CACHE" && -d "$PIP_CACHE" ]]; then
+    echo
+    echo "[pip] Cache size: $(human_size "$PIP_CACHE")"
+    if [[ "$MODE" == "dry-run" ]]; then
+      echo "[dry-run] would run: python3 -m pip cache purge"
+    elif confirm "Purge pip's download/wheel cache?"; then
+      python3 -m pip cache purge
+      echo "[done] pip cache purged."
+    else
+      echo "[skip] pip cache."
+    fi
+  else
+    echo "[skip] pip cache directory not found."
+  fi
+fi
+
+# ------------------------------------------------------------
+# 3. Chrome filesystem cache
+# ------------------------------------------------------------
+if check_app_running "Google Chrome"; then
+  remove_dir "Chrome filesystem cache" \
+    "$HOME_DIR/Library/Caches/Google/Chrome"
+fi
+
+# ------------------------------------------------------------
+# 4. Microsoft Edge filesystem cache
+# ------------------------------------------------------------
+if check_app_running "Microsoft Edge"; then
+  remove_dir "Microsoft Edge cache" \
+    "$HOME_DIR/Library/Caches/Microsoft Edge"
+fi
+
+# ------------------------------------------------------------
+# 5. Raspberry Pi Imager cache
+# ------------------------------------------------------------
+if check_app_running "Raspberry Pi Imager"; then
+  remove_dir "Raspberry Pi Imager cache" \
+    "$HOME_DIR/Library/Caches/Raspberry Pi"
+fi
+
+# ------------------------------------------------------------
+# 6. Android Studio cache (OPTIONAL)
+# ------------------------------------------------------------
+if [[ "$CLEAR_AS" -eq 1 ]]; then
+  if check_app_running "Android Studio"; then
+    as_dirs=("$HOME_DIR/Library/Caches/Google/AndroidStudio"*(N))
+    if [[ ${#as_dirs[@]} -gt 0 ]]; then
+      for as_path in "${as_dirs[@]}"; do
+        remove_dir "Android Studio cache ($(basename "$as_path"))" "$as_path"
+      done
+    else
+      echo
+      echo "[skip] No Android Studio caches found in $HOME_DIR/Library/Caches/Google."
+    fi
+  fi
+else
+  echo
+  echo "[info] Android Studio cache is NOT touched by default. Use --android-studio to clean."
+fi
+
+# ------------------------------------------------------------
+# 7. Chrome Service Worker CacheStorage (OPTIONAL)
+# ------------------------------------------------------------
+if [[ "$CLEAR_CHROME_SW" -eq 1 ]]; then
+  if check_app_running "Google Chrome"; then
+    sw_dirs=("$HOME_DIR/Library/Application Support/Google/Chrome/"*"/Service Worker/CacheStorage"(N))
+    if [[ ${#sw_dirs[@]} -gt 0 ]]; then
+      for sw_path in "${sw_dirs[@]}"; do
+        profile_name="$(basename "$(dirname "$(dirname "$sw_path")")")"
+        remove_dir "Chrome Service Worker CacheStorage ($profile_name)" "$sw_path"
+      done
+    else
+      echo
+      echo "[skip] No Chrome Service Worker CacheStorage directories found."
+    fi
+  fi
+else
+  echo
+  echo "[info] Chrome Service Worker/CacheStorage is NOT touched by default. Use --chrome-sw-cache to clean."
+fi
+
+# ------------------------------------------------------------
+# 8. Chrome On-Device AI model (OPTIONAL)
+# ------------------------------------------------------------
+AI_MODEL="$HOME_DIR/Library/Application Support/Google/Chrome/OptGuideOnDeviceModel"
+if [[ "$CLEAR_CHROME_AI" -eq 1 ]]; then
+  if [[ -e "$AI_MODEL" ]]; then
+    echo
+    echo "Chrome On-Device AI model: $(human_size "$AI_MODEL")"
+    echo "Path: $AI_MODEL"
+    echo "NOTE: Prefer turning off Chrome's On-device AI setting first."
+    echo "      Chrome may download the model again if the feature remains enabled."
+    if [[ "$MODE" == "dry-run" ]]; then
+      echo "[dry-run] would remove the model directory."
+    elif confirm "Remove the Chrome On-device AI model directory anyway?"; then
+      rm -rf -- "$AI_MODEL"
+      echo "[done] On-device model directory removed."
+    else
+      echo "[skip] Chrome On-device AI model."
+    fi
+  else
+    echo "[skip] Chrome On-device AI model not found."
+  fi
+else
+  echo
+  echo "[info] Chrome On-device AI model is NOT touched by default. Use --chrome-ai-model to clean."
+fi
+
+# ------------------------------------------------------------
+# 9. Playwright browser cache (OPTIONAL)
+# ------------------------------------------------------------
+if [[ "$CLEAR_PLAYWRIGHT" -eq 1 ]]; then
+  if command -v npx >/dev/null 2>&1; then
+    echo
+    if [[ "$MODE" == "dry-run" ]]; then
+      echo "[dry-run] would run: npx playwright uninstall --all"
+    elif confirm "Remove Playwright-managed browsers?"; then
+      npx playwright uninstall --all
+      echo "[done] Playwright browsers removed."
+    else
+      echo "[skip] Playwright."
+    fi
+  else
+    echo "[skip] npx not found."
+  fi
+else
+  echo
+  echo "[info] Playwright cache is NOT touched by default. Use --playwright to clean."
+fi
+
+# ------------------------------------------------------------
+# 10. npm cache (OPTIONAL)
+# ------------------------------------------------------------
+if [[ "$CLEAR_NPM" -eq 1 ]]; then
+  if command -v npm >/dev/null 2>&1; then
+    npm_cache_dir="$HOME_DIR/.npm/_cacache"
+    echo
+    echo "[npm] Cache size: $(human_size "$npm_cache_dir")"
+    if [[ "$MODE" == "dry-run" ]]; then
+      echo "[dry-run] would run: npm cache clean --force"
+    elif confirm "Clean npm cache?"; then
+      npm cache clean --force
+      echo "[done] npm cache cleaned."
+    else
+      echo "[skip] npm cache."
+    fi
+  else
+    echo "[skip] npm not found."
+  fi
+else
+  echo
+  echo "[info] npm cache is NOT touched by default. Use --npm-cache to clean."
+fi
+
+# ------------------------------------------------------------
+# 11. Gradle cache (OPTIONAL)
+# ------------------------------------------------------------
+if [[ "$CLEAR_GRADLE" -eq 1 ]]; then
+  remove_dir "Gradle cache" "$HOME_DIR/.gradle/caches"
+else
+  echo
+  echo "[info] Gradle cache is NOT touched by default. Use --gradle-cache to clean."
+fi
+
+# ------------------------------------------------------------
+# 12. Xcode DerivedData (OPTIONAL)
+# ------------------------------------------------------------
+if [[ "$CLEAR_XCODE" -eq 1 ]]; then
+  if check_app_running "Xcode"; then
+    remove_dir "Xcode DerivedData" "$HOME_DIR/Library/Developer/Xcode/DerivedData"
+    remove_dir "Xcode Archives" "$HOME_DIR/Library/Developer/Xcode/Archives"
+    remove_dir "iOS DeviceSupport" "$HOME_DIR/Library/Developer/Xcode/iOS DeviceSupport"
+  fi
+else
+  echo
+  echo "[info] Xcode DerivedData is NOT touched by default. Use --xcode to clean."
+fi
+
+# ------------------------------------------------------------
+# 13. Bun cache (OPTIONAL)
+# ------------------------------------------------------------
+if [[ "$CLEAR_BUN" -eq 1 ]]; then
+  if command -v bun >/dev/null 2>&1; then
+    bun_cache_dir="$HOME_DIR/.bun/install/cache"
+    echo
+    echo "[bun] Cache size: $(human_size "$bun_cache_dir")"
+    if [[ "$MODE" == "dry-run" ]]; then
+      echo "[dry-run] would run: bun pm cache rm"
+    elif confirm "Purge Bun package cache?"; then
+      bun pm cache rm
+      echo "[done] Bun cache purged."
+    else
+      echo "[skip] Bun cache."
+    fi
+  else
+    remove_dir "Bun install cache" "$HOME_DIR/.bun/install/cache"
+  fi
+else
+  echo
+  echo "[info] Bun cache is NOT touched by default. Use --bun-cache to clean."
+fi
+
+# ------------------------------------------------------------
+# 14. Cargo registry cache (OPTIONAL)
+# ------------------------------------------------------------
+if [[ "$CLEAR_CARGO" -eq 1 ]]; then
+  remove_dir "Cargo registry cache" "$HOME_DIR/.cargo/registry/cache"
+else
+  echo
+  echo "[info] Cargo cache is NOT touched by default. Use --cargo-cache to clean."
+fi
+
+# ------------------------------------------------------------
+# 15. Docker system prune (OPTIONAL)
+# ------------------------------------------------------------
+if [[ "$CLEAR_DOCKER" -eq 1 ]]; then
+  if command -v docker >/dev/null 2>&1; then
+    if docker info >/dev/null 2>&1; then
+      echo
+      echo "[docker] Previewing reclaimable disk space:"
+      docker system df 2>/dev/null || true
+      if [[ "$MODE" == "dry-run" ]]; then
+        echo "[dry-run] would run: docker system prune -f"
+      elif confirm "Prune unused Docker containers, networks, images?"; then
+        docker system prune -f
+        echo "[done] Docker system prune completed."
+      else
+        echo "[skip] Docker prune."
+      fi
+    else
+      echo
+      echo "[skip] Docker daemon is not active."
+    fi
+  else
+    echo
+    echo "[skip] docker command not found."
+  fi
+else
+  echo
+  echo "[info] Docker prune is NOT executed by default. Use --docker to clean."
+fi
+
+# ------------------------------------------------------------
+# 16. Desktop apps cache (OPTIONAL)
+# ------------------------------------------------------------
+if [[ "$CLEAR_APPS" -eq 1 ]]; then
+  if check_app_running "Slack"; then
+    remove_dir "Slack HTTP cache" "$HOME_DIR/Library/Application Support/Slack/Cache"
+    remove_dir "Slack Service Worker cache" "$HOME_DIR/Library/Application Support/Slack/Service Worker/CacheStorage"
+  fi
+  if check_app_running "Discord"; then
+    remove_dir "Discord cache" "$HOME_DIR/Library/Application Support/discord/Cache"
+  fi
+  if check_app_running "zoom.us"; then
+    remove_dir "Zoom cache" "$HOME_DIR/Library/Caches/us.zoom.xos"
+  fi
+  if check_app_running "Spotify"; then
+    remove_dir "Spotify cache" "$HOME_DIR/Library/Caches/com.spotify.client"
+  fi
+else
+  echo
+  echo "[info] Desktop apps cache (Slack/Discord/Zoom/Spotify) is NOT touched by default. Use --apps-cache to clean."
+fi
+
+# ------------------------------------------------------------
+# 17. Local AI / ML cache (OPTIONAL)
+# ------------------------------------------------------------
+if [[ "$CLEAR_AI" -eq 1 ]]; then
+  remove_dir "Hugging Face hub cache" "$HOME_DIR/.cache/huggingface/hub"
+  remove_dir "PyTorch hub cache" "$HOME_DIR/.cache/torch/hub"
+else
+  echo
+  echo "[info] AI/ML model caches (HuggingFace/PyTorch) are NOT touched by default. Use --ai-cache to clean."
+fi
+
+# ------------------------------------------------------------
+# 18. User diagnostic reports & logs (OPTIONAL)
+# ------------------------------------------------------------
+if [[ "$CLEAR_LOGS" -eq 1 ]]; then
+  remove_dir "User Diagnostic Reports (crash logs)" "$HOME_DIR/Library/Logs/DiagnosticReports"
+else
+  echo
+  echo "[info] User crash logs are NOT touched by default. Use --logs to clean."
+fi
+
+# ------------------------------------------------------------
+# 19. User Trash (OPTIONAL)
+# ------------------------------------------------------------
+if [[ "$CLEAR_TRASH" -eq 1 ]]; then
+  TRASH_DIR="$HOME_DIR/.Trash"
+  if [[ -d "$TRASH_DIR" ]]; then
+    TRASH_SIZE="$(human_size "$TRASH_DIR")"
+    echo
+    echo "User Trash: $TRASH_SIZE"
+    echo "  $TRASH_DIR"
+    if [[ "$MODE" == "dry-run" ]]; then
+      echo "  [dry-run] would empty Trash"
+    elif confirm "Empty the Trash?"; then
+      rm -rf -- "$TRASH_DIR"/*(N) "$TRASH_DIR"/.*(N) 2>/dev/null || true
+      echo "  [done] Trash emptied."
+    else
+      echo "  [skip] Trash kept."
+    fi
+  fi
+else
+  echo
+  echo "[info] Trash is NOT emptied by default. Use --trash to empty."
+fi
+
+# ------------------------------------------------------------
+# Final report & Reclaimed Space Summary
+# ------------------------------------------------------------
+echo
+echo "============================================================"
+echo " Final cache report"
+echo "============================================================"
+du -sh "$HOME_DIR/Library/Caches"/*(N) 2>/dev/null | sort -h | tail -25 || true
+
+echo
+echo "Disk space now:"
+df -h /
+
+END_AVAIL_KB=$(get_avail_kb)
+DIFF_KB=$(( END_AVAIL_KB - START_AVAIL_KB ))
+
+echo
+if [[ "$MODE" == "dry-run" ]]; then
+  echo "Summary: Dry run complete. No files were removed."
+elif (( DIFF_KB > 0 )); then
+  echo "Summary: Successfully reclaimed $(format_kb "$DIFF_KB") of disk space!"
+else
+  echo "Summary: Cleanup complete. Available disk space: $(format_kb "$END_AVAIL_KB")."
+fi
+
+echo "Note: macOS APFS and System Settings may take a few moments to recalculate storage categories."
+echo
